@@ -222,6 +222,18 @@ test("parseAgyModelsOutput splits id and display name on the first tab", () => {
 	]);
 });
 
+test("parseAgyModelsOutput skips banner lines with whitespace in the id", () => {
+	assert.deepEqual(
+		parseAgyModelsOutput(
+			"Fetching available models...\ngemini-3.8-flash-high\tGemini 3.8 Flash (High)\r\n\ngpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n",
+		),
+		[
+			{ id: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" },
+			{ id: "gpt-oss-120b-medium", name: "GPT-OSS 120B (Medium)" },
+		],
+	);
+});
+
 test("toBaseModels collapses effort variants and uses the CLI display name", () => {
 	const models = toBaseModels([
 		{ id: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" },
@@ -236,6 +248,19 @@ test("toBaseModels collapses effort variants and uses the CLI display name", () 
 	assert.equal(models[1].id, "claude-sonnet-4-6");
 	assert.equal(models[1].name, "Claude Sonnet 4.6 (Thinking)");
 	assert.equal(models[1].effortLevels, undefined);
+});
+
+test("toBaseModels records effortSlugs when a bare id carries its effort in the display name", () => {
+	const models = toBaseModels([
+		{ id: "gemini-3.5-flash-medium", name: "Gemini 3.5 Flash (Medium)" },
+		{ id: "gemini-3.5-flash", name: "Gemini 3.5 Flash (High)" },
+		{ id: "gemini-3.5-flash-low", name: "Gemini 3.5 Flash (Low)" },
+	]);
+	assert.equal(models.length, 1);
+	assert.equal(models[0].id, "gemini-3.5-flash");
+	assert.equal(models[0].name, "Gemini 3.5 Flash");
+	assert.deepEqual([...models[0].effortLevels].sort(), ["high", "low", "medium"]);
+	assert.deepEqual(models[0].effortSlugs, { high: "gemini-3.5-flash" });
 });
 
 test("bundled fallback names only models the CLI currently offers", () => {
@@ -541,13 +566,19 @@ test("panel distinguishes registered models from a new catalog pending reload", 
 	await withClearedModels(() => withFakeAgy(
 		'if (process.argv[2] === "models") process.stdout.write("new-model\\tNew Model\\n");',
 		async () => {
+			const fakeBin = process.env.AGY_PI_BIN;
 			let command;
 			let registeredCount;
-			agyPiExtension({
-				registerProvider(_id, config) { registeredCount = config.models.length; },
-				registerCommand(_name, config) { command = config; },
-				on() {},
-			});
+			process.env.AGY_PI_BIN = missingBin();
+			try {
+				agyPiExtension({
+					registerProvider(_id, config) { registeredCount = config.models.length; },
+					registerCommand(_name, config) { command = config; },
+					on() {},
+				});
+			} finally {
+				restoreEnv("AGY_PI_BIN", fakeBin);
+			}
 			assert.ok(registeredCount > 1);
 			await command.handler("update", { ui: { notify() {} } });
 			const choices = ["Models (registered)", "Back", "Configuration (source presence)", "Close"];

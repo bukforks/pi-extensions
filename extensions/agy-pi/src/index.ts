@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
@@ -66,6 +66,8 @@ export interface AgyModelInfo {
   image?: boolean;
   /** Reasoning-effort variants exposed by agy for this family (e.g. low/medium/high). */
   effortLevels?: string[];
+  /** Slugs for effort levels whose agy id is not `<id>-<level>` (e.g. gemini-3.5-flash = High). */
+  effortSlugs?: Record<string, string>;
 }
 
 let registeredModels: AgyModelInfo[] = [];
@@ -73,7 +75,7 @@ let lastDiscoveryTime: number | undefined;
 let lastDiscoveryError: string | undefined;
 let lastCliStatus: CliStatus | undefined;
 let providerRegisteredCount = 0;
-let providerRegisteredSource: "environment override" | "bundled catalog" = "bundled catalog";
+let providerRegisteredSource: "environment override" | "CLI discovery" | "bundled catalog" = "bundled catalog";
 let catalogPendingReload = false;
 
 const AGY_PANEL_STATUS = "Provider status";
@@ -138,7 +140,7 @@ export function parseAgyModelsOutput(stdout: string): Array<{ id: string; name?:
     if (!raw.trim()) continue;
     const [idField, nameField] = raw.split("\t");
     const id = idField?.trim() ?? "";
-    if (!id) continue;
+    if (!id || /\s/.test(id)) continue; // skip banner lines like "Fetching available models..."
     const name = nameField?.trim();
     models.push(name ? { id, name } : { id });
   }
@@ -149,19 +151,26 @@ export type AgyModelRef = string | { id: string; name?: string };
 
 /** Collapse -high/-medium/-low variant ids into one base model per family. */
 export function toBaseModels(refs: AgyModelRef[]): AgyModelInfo[] {
-  const groups = new Map<string, { levels: Set<string>; bundled?: AgyModelInfo; name?: string }>();
+  const groups = new Map<string, { levels: Set<string>; slugs: Map<string, string>; bundled?: AgyModelInfo; name?: string }>();
   const seen = new Set<string>();
   for (const ref of refs) {
     const id = typeof ref === "string" ? ref.trim() : ref.id.trim();
     if (!id || seen.has(id)) continue;
     seen.add(id);
     const name = typeof ref === "string" ? undefined : ref.name?.trim();
-    const effort = effortOf(id);
+    let effort = effortOf(id);
     const baseId = effort ? id.slice(0, id.length - effort.length - 1) : id;
     let group = groups.get(baseId);
     if (!group) {
-      group = { levels: new Set(), bundled: bundledForBase(baseId) };
+      group = { levels: new Set(), slugs: new Map(), bundled: bundledForBase(baseId) };
       groups.set(baseId, group);
+    }
+    if (!effort && name) {
+      const named = name.match(/\((High|Medium|Low)\)$/i)?.[1]?.toLowerCase();
+      if (named) {
+        effort = named;
+        group.slugs.set(named, id);
+      }
     }
     if (effort) group.levels.add(effort);
     if (name && !group.name) group.name = stripEffortName(name);
@@ -175,6 +184,7 @@ export function toBaseModels(refs: AgyModelRef[]): AgyModelInfo[] {
     reasoning: group.bundled?.reasoning,
     image: group.bundled?.image,
     ...(group.levels.size ? { effortLevels: [...group.levels] } : {}),
+    ...(group.slugs.size ? { effortSlugs: Object.fromEntries(group.slugs) } : {}),
   }));
 }
 
@@ -206,7 +216,26 @@ export function agySlugForLevel(modelId: string, level?: string): string {
           EFFORT_ORDER.indexOf(a) - EFFORT_ORDER.indexOf(b),
       )[0];
   }
-  return `${modelId}-${want}`;
+  return info?.effortSlugs?.[want] ?? `${modelId}-${want}`;
+}
+
+const MODELS_TIMEOUT_MS = 5_000;
+
+/** Run `agy models` at load time; undefined on any failure or empty result. */
+function loadCliModelsSync(): AgyModelInfo[] | undefined {
+  try {
+    const stdout = execFileSync(agyBin(), ["models"], {
+      encoding: "utf8",
+      timeout: MODELS_TIMEOUT_MS,
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+    });
+    const models = toBaseModels(parseAgyModelsOutput(stdout));
+    return models.length ? models : undefined;
+  } catch (error) {
+    lastDiscoveryError = error instanceof Error ? error.message : String(error);
+    return undefined;
+  }
 }
 
 async function runCapture(
@@ -589,7 +618,7 @@ function providerModel(model: AgyModelInfo) {
   const { reasoning, thinkingLevelMap } = thinkingConfig(model);
   return {
     id: model.id,
-    name: `${model.name} (Agy)`,
+    name: model.name,
     reasoning,
     ...(reasoning && thinkingLevelMap ? { thinkingLevelMap } : {}),
     input: inputTypes,
@@ -729,16 +758,18 @@ function statusLines(): string[] {
 }
 
 export default function agyPiExtension(pi: ExtensionAPI) {
-  // Register synchronously from bundled/env-configured models so the
-  // provider exists before any session starts. Async CLI discovery here
-  // resolves after session replacement and makes the extension ctx stale
-  // (registerProvider throws "ctx is stale"), so the provider never loads.
-  // Use /agy-pi update (+ /reload) to pick up freshly discovered models.
+  // Register synchronously so the provider exists before any session starts.
+  // Async discovery here resolves after session replacement and makes the
+  // extension ctx stale (registerProvider throws "ctx is stale"), so `agy models`
+  // runs synchronously. Order: AGY_PI_MODELS -> `agy models` -> bundled list.
   const configured = configuredModels();
-  const modelIds = configured ?? BUNDLED_MODELS.map((m) => m.id);
-  registeredModels = toBaseModels(modelIds);
+  const discovered = configured ? undefined : loadCliModelsSync();
+  registeredModels = configured
+    ? toBaseModels(configured)
+    : discovered ?? toBaseModels(BUNDLED_MODELS.map((m) => m.id));
+  if (discovered) lastDiscoveryTime = Date.now();
   providerRegisteredCount = registeredModels.length;
-  providerRegisteredSource = configured ? "environment override" : "bundled catalog";
+  providerRegisteredSource = configured ? "environment override" : discovered ? "CLI discovery" : "bundled catalog";
   catalogPendingReload = false;
 
   pi.registerProvider(PROVIDER_ID, {
